@@ -7,13 +7,15 @@
 #include<sys/shm.h>
 #include<time.h>
 #include<signal.h>
+#include<sys/msg.h>
 
-/*
- * NOTES FOR TMRW
- * Move processTable to global memory. Use calloc to determine its size. Make sure to free it at the end!
- * Can also move sh_key and shm_id to glbal memory. this would allow me to shmdt and shmctl anywhere.
- * I think(?) I can use a switch in sighandler to differntiate alarm from ctrl+c, but they won't be too different anyway.
- */
+#define PERMS 0644
+
+typedef struct msgBuffer {
+	long mtype;
+	char strData[100];
+	int intData;
+} msgBuffer;
 
 struct PCB {
 	int occupied;
@@ -21,6 +23,8 @@ struct PCB {
 	int startTimeSec;
 	int startTimeNano;
 };
+
+// GLOBAL VARIABLES
 
 //For storing each child's PCB. Memory is allocated in main
 struct PCB *processTable;
@@ -30,8 +34,13 @@ int sh_key;
 int shm_id;
 int *shm_ptr;
 
+//Message queue id
+int msqid;
+
 //Needed for killing all child processes
 int arraySize;
+
+// FUNCTIONS
 
 void help() {
         printf("This program is designed to have a parent process fork off into child processes.\n");
@@ -69,6 +78,12 @@ void terminateProgram(int signum) {
 	free(processTable);
 	processTable = NULL;
 
+	// get rid of message queue
+	if (msgctl(msqid, IPC_RMID, NULL) == -1) {
+		perror("msgctl to get rid of queue in parent failed");
+		exit(1);
+	}
+
 	printf("Program is terminating. Goodbye!\n");
 	exit(1);
 }
@@ -83,23 +98,23 @@ void sighandler(int signum) {
 	printf("If you're seeing this, then bad things have happened.\n");
 }
 
-/*
-void startPCB(int tableEntry, struct PCB *processTable[], int pidNumber, int *time) {
-	(*processTable[tableEntry]).occupied = 1;
-	(*processTable[tableEntry]).pid = pidNumber;
-	(*processTable[tableEntry]).startTimeSec = time[0];
-	(*processTable[tableEntry]).startTimeNano = time[1];
+
+void startPCB(int tableEntry, int pidNumber, int *time) {
+	processTable[tableEntry].occupied = 1;
+	processTable[tableEntry].pid = pidNumber;
+	processTable[tableEntry].startTimeSec = time[0];
+	processTable[tableEntry].startTimeNano = time[1];
 }
 
-void endPCB(int pidNumber, int tableSize, struct PCB *processTable[]) {
+void endPCB(int pidNumber) {
 	int i;
-	for(i = 0; i < tableSize; i++) {
-		if(processTable[i]->pid == pidNumber) {
-			processTable[i]->occupied = 0;
+	for(i = 0; i < arraySize; i++) {
+		if(processTable[i].pid == pidNumber) {
+			processTable[i].occupied = 0;
 			return;
 		}
 	}
-}*/
+}
 
 void outputTable(int rows, struct PCB processTable[]) {
 	printf("Process Table:\nEntry Occupied   PID\tStartS StartN\n");
@@ -117,11 +132,7 @@ int randNumGenerator(int max) {
 int main(int argc, char** argv) {
 	alarm(60);
 	signal(SIGALRM, sighandler);
-	signal(SIGINT, sighandler);
-	int option;
-	int proc;
-	int simul;
-	int timelimit;
+	signal(SIGINT, sighandler);	
 
 	//allocate shared memory
 	sh_key = ftok("./oss.c", 0);
@@ -137,7 +148,28 @@ int main(int argc, char** argv) {
 		printf("Attaching to shared memory failed\n");
 		exit(1);
 	}
-	
+
+	//message queue setup
+	msgBuffer buf0, buf1;
+	key_t key;
+	system("touch msgq.txt");
+
+	//get a key for our message queue
+	if ((key = ftok("msgq.txt", 1)) == -1) {
+		perror("ftok");
+		exit(1);
+	}
+
+	//create our message queue
+	if ((msqid = msgget(key, PERMS | IPC_CREAT)) == -1) {
+		perror("msgget in parent");
+		exit(1);
+	}
+
+	int option;
+	int proc;
+	int simul;
+	int timelimit;
 
 	while ((option = getopt(argc, argv, "hn:s:t:")) != -1) {
   		switch(option) {
@@ -191,10 +223,7 @@ int main(int argc, char** argv) {
        			exit(1);
        		}
 		else {
-			processTable[runningChildren].occupied = 1;
-			processTable[runningChildren].pid = childPid;
-			processTable[runningChildren].startTimeSec = shm_ptr[0];
-			processTable[runningChildren].startTimeNano = shm_ptr[1];
+			startPCB(runningChildren, childPid, shm_ptr);
 			runningChildren++;
 			totalChildren++;
 		}
@@ -206,10 +235,6 @@ int main(int argc, char** argv) {
 	do {
 		incrementClock(shm_ptr);
 
-		//Use an alarm for this
-		/*if(sixtySecondsHasPassed)
-			terminateProgram();*/
-		
 		if(abs(shm_ptr[1] - outputTimer) >= halfSecond){
 			outputTimer = shm_ptr[1];
 			printf("\nOSS PID:%d SysClockS:%d SysClockNano:%d\n", getpid(), shm_ptr[0], shm_ptr[1]); 
@@ -219,13 +244,9 @@ int main(int argc, char** argv) {
 		int status;
 		int pid = waitpid(-1, &status, WNOHANG); //Will return 0 if no processes have terminated
 		if(pid) {
-			int i;
-			for(i = 0; i < arraySize; i++) {
-				if(processTable[i].pid == pid)
-					processTable[i].occupied = 0;
-			}
+			endPCB(pid); //Sets occupied to 0
 			runningChildren--;
-			if(totalChildren < proc) {
+			if(totalChildren < arraySize) {
 				pid_t childPid = fork(); //Launches child
 				if(childPid == 0) {
 					randNumS = randNumGenerator(timelimit);
@@ -236,10 +257,7 @@ int main(int argc, char** argv) {
 					exit(1);
 				}
 				else {
-					processTable[totalChildren].occupied = 1;
-					processTable[totalChildren].pid = childPid;
-					processTable[totalChildren].startTimeSec = shm_ptr[0];
-					processTable[totalChildren].startTimeNano = shm_ptr[1];
+					startPCB(totalChildren, childPid, shm_ptr);
 					runningChildren++;
 					totalChildren++;
 				}
