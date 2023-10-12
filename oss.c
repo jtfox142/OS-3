@@ -6,6 +6,14 @@
 #include<sys/ipc.h>
 #include<sys/shm.h>
 #include<time.h>
+#include<signal.h>
+
+/*
+ * NOTES FOR TMRW
+ * Move processTable to global memory. Use calloc to determine its size. Make sure to free it at the end!
+ * Can also move sh_key and shm_id to glbal memory. this would allow me to shmdt and shmctl anywhere.
+ * I think(?) I can use a switch in sighandler to differntiate alarm from ctrl+c, but they won't be too different anyway.
+ */
 
 struct PCB {
 	int occupied;
@@ -13,6 +21,17 @@ struct PCB {
 	int startTimeSec;
 	int startTimeNano;
 };
+
+//For storing each child's PCB. Memory is allocated in main
+struct PCB *processTable;
+
+//Shared memory variables
+int sh_key;
+int shm_id;
+int *shm_ptr;
+
+//Needed for killing all child processes
+int arraySize;
 
 void help() {
         printf("This program is designed to have a parent process fork off into child processes.\n");
@@ -27,12 +46,43 @@ void help() {
 }
 
 void incrementClock(int *shm_ptr) {
-	shm_ptr[1] += 10000;
+	shm_ptr[1] += 800;
 	if(shm_ptr[1] >= 1000000000) {
 		shm_ptr[1] = 0;
 		shm_ptr[0] += 1;
 	}
 }
+
+void terminateProgram(int signum) {
+	//detaches from and deletes shared memory
+	shmdt(shm_ptr);
+	shmctl(shm_id, IPC_RMID, NULL);
+
+	//Kills any remaining active child processes
+	int count;
+	for(count = 0; count < arraySize; count++) {
+		if(processTable[count].occupied)
+			kill(processTable[count].pid, signum);
+	}
+
+	//Frees memory allocated for processTable
+	free(processTable);
+	processTable = NULL;
+
+	printf("Program is terminating. Goodbye!\n");
+	exit(1);
+}
+
+//Can use processTable to get active child process pids and kill them
+//How to free shared memory?
+//Could use an int runFlag = 1, then sigHandler sets runFlag to 0. If !runFlag, shmdt() && shmctl
+//Where to test for this flag?
+void sighandler(int signum) {
+	printf("\nCaught signal %d\n", signum);
+	terminateProgram(signum);
+	printf("If you're seeing this, then bad things have happened.\n");
+}
+
 /*
 void startPCB(int tableEntry, struct PCB *processTable[], int pidNumber, int *time) {
 	(*processTable[tableEntry]).occupied = 1;
@@ -65,21 +115,23 @@ int randNumGenerator(int max) {
 }
 
 int main(int argc, char** argv) {
+	alarm(60);
+	signal(SIGALRM, sighandler);
+	signal(SIGINT, sighandler);
 	int option;
 	int proc;
 	int simul;
 	int timelimit;
 
 	//allocate shared memory
-	const int sh_key = ftok("./oss.c", 0);
-	const int shm_id = shmget(sh_key, sizeof(int) * 2, IPC_CREAT | 0666);
+	sh_key = ftok("./oss.c", 0);
+	shm_id = shmget(sh_key, sizeof(int) * 2, IPC_CREAT | 0666);
 	if(shm_id <= 0) {
 		printf("Shared memory allocation failed\n");
 		exit(1);
 	}
 
 	//attach to shared memory
-	int *shm_ptr;
 	shm_ptr = shmat(shm_id, 0 ,0);
 	if(shm_ptr <= 0) {
 		printf("Attaching to shared memory failed\n");
@@ -103,8 +155,10 @@ int main(int argc, char** argv) {
 				break;
 		}
 	}
-
-	struct PCB processTable[proc];
+	
+	arraySize = proc;
+	//Allocates memory for the processTable stored in global memory
+	processTable = calloc(arraySize, sizeof(struct PCB));
 
 	int totalChildren;
 	int runningChildren;
@@ -152,6 +206,7 @@ int main(int argc, char** argv) {
 	do {
 		incrementClock(shm_ptr);
 
+		//Use an alarm for this
 		/*if(sixtySecondsHasPassed)
 			terminateProgram();*/
 		
@@ -164,7 +219,11 @@ int main(int argc, char** argv) {
 		int status;
 		int pid = waitpid(-1, &status, WNOHANG); //Will return 0 if no processes have terminated
 		if(pid) {
-			processTable[totalChildren].occupied = 0;
+			int i;
+			for(i = 0; i < arraySize; i++) {
+				if(processTable[i].pid == pid)
+					processTable[i].occupied = 0;
+			}
 			runningChildren--;
 			if(totalChildren < proc) {
 				pid_t childPid = fork(); //Launches child
@@ -191,9 +250,8 @@ int main(int argc, char** argv) {
 	pid_t wpid;
 	int status = 0;
 	while((wpid = wait(&status)) > 0);
-	//detach from and delete memory
-	shmdt(shm_ptr);
-	shmctl(shm_id, IPC_RMID, NULL);
+	terminateProgram(SIGTERM);
 	return EXIT_SUCCESS;
 }
+
 
