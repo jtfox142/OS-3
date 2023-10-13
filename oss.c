@@ -13,7 +13,6 @@
 
 typedef struct msgBuffer {
 	long mtype;
-	char strData[100];
 	int intData;
 } msgBuffer;
 
@@ -116,11 +115,27 @@ void endPCB(int pidNumber) {
 	}
 }
 
-void outputTable(int rows, struct PCB processTable[]) {
+void outputTable() {
 	printf("Process Table:\nEntry Occupied   PID\tStartS StartN\n");
 	int i;
-	for(i = 0; i < rows; i++) {
+	for(i = 0; i < arraySize; i++) {
 		printf("%d\t%d\t%d\t%d\t%d\t\n\n", i, processTable[i].occupied, processTable[i].pid, processTable[i].startTimeSec, processTable[i].startTimeNano);
+	}
+}
+
+void sendingOutput(int chldNum, int chldPid, FILE *file) {
+	printf("OSS:\t Sending message to worker %d PID %d at time %d:%d\n", chldNum, chldPid, shm_ptr[0], shm_ptr[1]);
+	fprintf(file, "OSS:\t Sending message to worker %d PID %d at time %d:%d\n", chldNum, chldPid, shm_ptr[0], shm_ptr[1]);
+}
+
+void receivingOutput(int chldNum, int chldPid, FILE *file, msgBuffer rcvbuf) {
+	if(rcvbuf.intData > 0) {
+		printf("OSS:\t Receiving message from worker %d PID %d at time %d:%d\n", chldNum, chldPid, shm_ptr[0], shm_ptr[1]);
+		fprintf(file, "OSS:\t Receiving message from worker %d PID %d at time %d:%d\n", chldNum, chldPid, shm_ptr[0], shm_ptr[1]);
+	}
+	else {
+		printf("Worker %d PID %d is planning to terminate.\n", chldNum, chldPid);	
+		fprintf(file, "Worker %d PID %d is planning to terminate.\n", chldNum, chldPid);	
 	}
 }
 
@@ -130,6 +145,7 @@ int randNumGenerator(int max) {
 }
 
 int main(int argc, char** argv) {
+	//signals to terminate program properly if user hits ctrl+c or 60 seconds pass
 	alarm(60);
 	signal(SIGALRM, sighandler);
 	signal(SIGINT, sighandler);	
@@ -148,9 +164,12 @@ int main(int argc, char** argv) {
 		printf("Attaching to shared memory failed\n");
 		exit(1);
 	}
+	
+	//set clock to zero
+        shm_ptr[0] = 0;
+        shm_ptr[1] = 0;
 
 	//message queue setup
-	msgBuffer buf0, buf1;
 	key_t key;
 	system("touch msgq.txt");
 
@@ -166,12 +185,14 @@ int main(int argc, char** argv) {
 		exit(1);
 	}
 
+	//user input vars
 	int option;
 	int proc;
 	int simul;
 	int timelimit;
+	FILE *fptr;
 
-	while ((option = getopt(argc, argv, "hn:s:t:")) != -1) {
+	while ((option = getopt(argc, argv, "hn:s:t:f:")) != -1) {
   		switch(option) {
    			case 'h':
     				help();
@@ -185,22 +206,24 @@ int main(int argc, char** argv) {
 			case 't':
 				timelimit = atoi(optarg);
 				break;
+			case'f':
+				fptr = fopen(optarg, "a");
 		}
 	}
 	
+	//sets the global var equal to the user arg
 	arraySize = proc;
-	//Allocates memory for the processTable stored in global memory
+
+	//define a msgbuffer for each child to be created. Does it need to be size proc, or could it be size simul?
+	msgBuffer buf;
+
+	//allocates memory for the processTable stored in global memory
 	processTable = calloc(arraySize, sizeof(struct PCB));
 
 	int totalChildren;
 	int runningChildren;
 	totalChildren = 0;
-	runningChildren = 0;
-
-	//set clock to zero
-        shm_ptr[0] = 0;
-        shm_ptr[1] = 0;
-
+	runningChildren = 0;	
 
 	//vars for fetching worker termTime values
 	const int maxNano = 1000000000;
@@ -229,22 +252,27 @@ int main(int argc, char** argv) {
 		}
        	}
       
+	//outputTimer ensures that output occurs every half second
 	int outputTimer;
 	outputTimer = 0;
 	int halfSecond = 500000000;
+
+	//iterator to keep track of the next child in rotation
+	int nextChild;
+	nextChild = 0;
 	do {
 		incrementClock(shm_ptr);
 
 		if(abs(shm_ptr[1] - outputTimer) >= halfSecond){
 			outputTimer = shm_ptr[1];
 			printf("\nOSS PID:%d SysClockS:%d SysClockNano:%d\n", getpid(), shm_ptr[0], shm_ptr[1]); 
-			outputTable(proc, processTable);
+			outputTable();
 		}
 		
 		int status;
-		int pid = waitpid(-1, &status, WNOHANG); //Will return 0 if no processes have terminated
+		int pid = waitpid(-1, &status, WNOHANG); //will return 0 if no processes have terminated
 		if(pid) {
-			endPCB(pid); //Sets occupied to 0
+			endPCB(pid); //sets processTable.occupied to 0
 			runningChildren--;
 			if(totalChildren < arraySize) {
 				pid_t childPid = fork(); //Launches child
@@ -263,6 +291,35 @@ int main(int argc, char** argv) {
 				}
 			}
 		}
+
+		//gets the pid of the next child in the rotation
+		int msgPid;
+		msgPid = processTable[nextChild].pid;
+
+		buf.mtype = msgPid;
+		buf.intData = msgPid;
+
+		if(msgsnd(msqid, &buf, sizeof(msgBuffer) - sizeof(long), 0) == -1) {
+			perror("msgsnd to child failed\n");
+			exit(1);
+		}
+
+		sendingOutput(nextChild, msgPid, fptr);
+
+		msgBuffer rcvbuf;
+		if(msgrcv(msqid, &rcvbuf, sizeof(msgBuffer), getpid(), 0) == -1) {
+			perror("failed to receive message in parent\n");
+			exit(1);
+		}
+
+		receivingOutput(nextChild, msgPid, fptr, rcvbuf);
+
+		//keeps nextChild within the bounds of the array
+		if(nextChild == arraySize - 1)
+			nextChild = 0;
+		else
+			nextChild++;
+
 	} while(runningChildren);	
 
 	pid_t wpid;
